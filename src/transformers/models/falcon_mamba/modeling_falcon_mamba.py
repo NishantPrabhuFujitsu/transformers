@@ -439,6 +439,125 @@ class FalconMambaBlock(nn.Module):
         )
         hidden_states = residual + hidden_states
         return hidden_states
+    
+    
+class LACEMixer(nn.Module):
+    
+    def __init__(self, config: FalconMambaConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.dim = config.lace_intermediate_size
+        self.layer_idx = layer_idx
+        
+        self.in_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.dw_proj = nn.Linear(self.hidden_size, self.dim, bias=False)
+        self.gamma_net = nn.Sequential(
+            nn.Linear(self.hidden_size, self.dim, bias=False), nn.GELU(),
+            nn.Linear(self.dim, self.dim ** 3 + self.dim ** 2, bias=False),
+        )
+        self.beta_net = nn.Sequential(
+            nn.Linear(self.hidden_size, self.dim, bias=False), nn.GELU(),
+            nn.Linear(self.dim, self.dim ** 2 + self.dim, bias=False),
+        )
+        self.out_proj = nn.Linear(self.dim, self.hidden_size, bias=False)
+        
+    def forward(
+        self, 
+        hidden_states: torch.Tensor, 
+        cache_params: Optional[MambaCache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.LongTensor] = None, 
+    ):
+        # cache_params and cache_position are currently unused, will see if they
+        # have applicability here later when optimizing code
+        B, L, _ = hidden_states.shape
+        
+        if attention_mask is not None:
+            hidden_states = hidden_states * attention_mask.unsqueeze(1)
+        
+        # Project inputs to working dimension and append time step
+        X = self.in_proj(hidden_states)                                 # (B, L, H)
+        
+        # Initialize DW
+        if L == 1:
+            DW = torch.zeros(B, 1, self.dim).float().to(X.device)       # (B, 1, H)
+        elif L == 2:
+            DW = torch.cat([                                            # (B, 2, H)
+                (X[:, 1, :] - X[:, 0, :]).unsqueeze(1),
+                (X[:, 1, :] - X[:, 0, :]).unsqueeze(1),
+            ], dim=1)
+        else:
+            DW = torch.cat([                                            # (B, L, H)
+                (X[:, 1, :] - X[:, 0, :]).unsqueeze(1),                 # (B, 1, H)
+                (X[:, 2:, :] - X[:, :-2, :]) * 0.5,                     # (B, L-2, H)
+                (X[:, -1, :] - X[:, -2, :]).unsqueeze(1),               # (B, 1, H)
+            ], dim=1)
+            
+        DW = self.dw_proj(DW)                                           # (B, L, D)   
+        ones = torch.ones(B, L, 1).float().to(X.device)                 # (B, L, 1)
+        DW = torch.cat([DW, ones], dim=-1)                              # (B, L, D+1)
+        
+        # Get A and R using gamma and beta, then compute updates for Z
+        A = self.gamma_net(X).view(B, L, self.dim, self.dim + 1, self.dim)
+        R = self.beta_net(X).view(B, L, self.dim, self.dim + 1)
+        
+        # Initialize Z
+        Z_cache = torch.zeros(B, L, self.dim).float().to(X.device)
+        Z = torch.zeros(B, self.dim).float().to(X.device)
+        
+        for i in range(L):
+            A_upd = torch.einsum("bdfh,bf,bh->bd", A[:, i, ...], DW[:, i, :], Z)
+            R_upd = torch.einsum("bdf,bf->bd", R[:, i, ...], DW[:, i, :])
+            Z += A_upd + R_upd
+            Z_cache[:, i, :] = Z
+        
+        # Project Z back to hidden_size and return
+        hidden_states = self.out_proj(Z_cache)
+        return hidden_states
+    
+    
+class LACEBlock(nn.Module):
+    
+    def __init__(self, config: FalconMambaConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.mixer = LACEMixer(config, layer_idx=layer_idx)
+        
+        # Config specific to LACE
+        self.do_residual = config.lace_do_residual
+        self.norm_inputs = config.lace_norm_inputs
+        self.residual_in_fp32 = config.residual_in_fp32
+        
+        if self.norm_inputs:
+            self.norm = FalconMambaRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        
+    def forward(
+        self,
+        hidden_states,
+        cache_params: Optional[MambaCache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.LongTensor] = None,
+    ):
+        if self.do_residual:
+            residual = hidden_states
+            if self.residual_in_fp32:
+                residual = residual.to(torch.float32)
+            
+        if self.norm_inputs:
+            hidden_states = self.norm(hidden_states.to(dtype=self.norm.weight.dtype))
+
+        hidden_states = self.mixer(
+            hidden_states, 
+            cache_params=cache_params, 
+            cache_position=cache_position, 
+            attention_mask=attention_mask
+        )
+        if self.do_residual:
+            hidden_states = residual + hidden_states
+        
+        return hidden_states
 
 
 # Copied from transformers.models.mamba.modeling_mamba.MambaPreTrainedModel with Mamba->FalconMamba
@@ -614,6 +733,9 @@ class FalconMambaModel(FalconMambaPreTrainedModel):
         self.layers = nn.ModuleList(
             [FalconMambaBlock(config, layer_idx=idx) for idx in range(config.num_hidden_layers)]
         )
+        if config.lace_num_layers > 0:
+            for i in range(config.lace_num_layers):
+                self.layers.append(LACEBlock(config, layer_idx=i + config.num_hidden_layers))
 
         self.gradient_checkpointing = False
         self.norm_f = FalconMambaRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
