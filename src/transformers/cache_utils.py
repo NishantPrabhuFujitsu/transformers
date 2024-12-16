@@ -1838,6 +1838,7 @@ class MambaCache:
             )
         self.dtype = dtype
         self.max_batch_size = batch_size or max_batch_size
+        self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.ssm_state_size = config.state_size
         self.conv_kernel_size = config.conv_kernel
@@ -1855,6 +1856,20 @@ class MambaCache:
             self.max_batch_size,
             self.intermediate_size,
             self.ssm_state_size,
+            device=device,
+            dtype=dtype,
+        )
+        self.lace_states: torch.Tensor = torch.zeros(
+            config.num_hidden_layers,
+            self.max_batch_size,
+            self.ssm_state_size,
+            device=device,
+            dtype=dtype,
+        )
+        self.lace_last_inp_state: torch.Tensor = torch.zeros(
+            config.num_hidden_layers,
+            self.max_batch_size,
+            2 * self.hidden_size,
             device=device,
             dtype=dtype,
         )
@@ -1877,6 +1892,11 @@ class MambaCache:
     def update_ssm_state(self, layer_idx: int, new_ssm_state: torch.Tensor):
         self.ssm_states[layer_idx] = new_ssm_state.to(self.ssm_states.device)
         return self.ssm_states[layer_idx]
+    
+    def update_lace_state(self, layer_idx: int, new_lace_state: torch.Tensor, last_inp_state: torch.Tensor):
+        self.lace_states[layer_idx] = new_lace_state.to(self.lace_states.device)
+        self.lace_last_inp_state[layer_idx] = last_inp_state.to(self.lace_last_inp_state.device)
+        return self.lace_states[layer_idx]
 
     def reset(self):
         self.conv_states.zero_()
