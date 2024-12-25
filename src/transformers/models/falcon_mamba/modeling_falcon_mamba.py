@@ -446,21 +446,27 @@ class LACEMixer(nn.Module):
     def __init__(self, config: FalconMambaConfig, layer_idx: int):
         super().__init__()
         self.config = config
+        self.lidx_off = config.num_hidden_layers
         self.hidden_size = config.hidden_size
+        self.im_size = config.intermediate_size
+        self.conv_kernel_size = config.conv_kernel
         self.ssm_size = config.state_size
         self.layer_idx = layer_idx
-
         self.activation = config.hidden_act
         self.act = ACT2FN[config.hidden_act]
         
-        self.in_proj_fc1 = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
-        self.in_proj_fc2 = nn.Linear(self.hidden_size, 4 * self.hidden_size, bias=False)
-        self.out_proj_fc1 = nn.Linear(2 * self.hidden_size, self.hidden_size, bias=False)
-        self.out_proj_fc2 = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
-
-        self.A_fc = nn.Linear(self.hidden_size, 2 * self.hidden_size * self.ssm_size * self.ssm_size, bias=False)
-        self.B_E_fc = nn.Linear(self.hidden_size, 2 * self.ssm_size * (2 * self.hidden_size + 1), bias=False)
-        self.C_D_fc = nn.Linear(self.hidden_size, 4 * self.ssm_size * self.hidden_size, bias=False)
+        self.in_proj = nn.Linear(self.hidden_size, self.im_size, bias=config.use_bias)
+        self.conv1d = nn.Conv1d(
+            in_channels=self.im_size,
+            out_channels=self.im_size,
+            bias=config.use_conv_bias,
+            kernel_size=config.conv_kernel,
+            groups=self.im_size,
+            padding=config.conv_kernel - 1,
+        )
+        self.diff_proj_up = nn.Linear(4, self.ssm_size, bias=False)
+        self.diff_proj_dn = nn.Linear(self.ssm_size, 4, bias=False)
+        self.out_proj = nn.Linear(self.im_size, self.hidden_size, bias=config.use_bias)
 
     def forward(
         self, 
@@ -469,65 +475,66 @@ class LACEMixer(nn.Module):
         cache_position: Optional[torch.LongTensor] = None, 
         attention_mask: Optional[torch.LongTensor] = None
     ):
-        b, sl, d = hidden_states.shape
+        b, sl, _ = hidden_states.shape
         device = hidden_states.device
+        is_prefill = cache_position.shape[0] == self.conv_kernel_size
         
-        # Initialize ssm state from cache if passed (Z in our formulation)
-        if cache_params is not None:
-            Z = cache_params.lace_states[self.layer_idx].clone()
-            Z = Z.unsqueeze(1).to(hidden_states.device)
-            last_x_proj = cache_params.lace_last_inp_state[self.layer_idx].clone()
-            last_x_proj = last_x_proj.to(hidden_states.device)
+        # Initialize ssm state from cache if available
+        if is_prefill:
+            # TODO: Check if K_prev should still be proj of BOS embedding
+            M = torch.zeros((b, self.im_size), dtype=hidden_states.dtype, device=device)
+            K_cache = torch.zeros((b, self.im_size), dtype=hidden_states.dtype, device=device)
         else:
-            Z = torch.zeros((b, sl + 1, 2 * d), device=device)
+            M = cache_params.lace_states[self.layer_idx].clone().to(device)
+            K_cache = cache_params.lace_last_inp_state[self.layer_idx].clone().to(device)
+        
+        M_buffer = torch.zeros((b, sl, self.im_size), dtype=hidden_states.dtype, device=device)
         
         if attention_mask is not None:
-            hidden_states = hidden_states * attention_mask.unsqueeze(1)
+            hidden_states = hidden_states * attention_mask.unsqueeze(-1)
         
-        x_proj = self.in_proj_fc2(self.act(self.in_proj_fc1(hidden_states)))                # (B, L, 4D)
-        x_proj, y_proj = torch.chunk(x_proj, chunks=2, dim=-1)                              # (B, L, 2D) each
-        
-        # Build W
-        if self.training:
-            W = x_proj[:, 1:, :] - x_proj[:, :-1, :]                                        # (B, L-1, 2D)
-            # Appending zeros in beginning to ensure sequence length is maintained
-            # Otherwise update loop later will fail for last time step during training
-            W = torch.cat([torch.zeros((b, 1, 2 * d), device=device), W], dim=1)            # (B, L, 2D)
+        # Input projection
+        hidden_states = self.in_proj(hidden_states).transpose(1, 2).contiguous()            # (B, 2D, L)
+
+        # For convolution, during prefill we cache the last 3 time-steps of the input
+        # This is done so that it can be appended as context to single tokens during decoding
+        if is_prefill:
+            conv_state = nn.functional.pad(hidden_states, (self.conv_kernel_size - hidden_states.shape[-1], 0))
+            cache_params.update_conv_state(self.lidx_off + self.layer_idx, conv_state, cache_position)
+            hidden_states = self.act(self.conv1d(hidden_states)[:, :, :sl])                 # (B, 2D, L)
         else:
-            # During inference, last time-step's x_proj is loaded from cache to compute W
-            W = x_proj - last_x_proj.unsqueeze(1)                                           # (B, 1, 2D)
+            conv_state = cache_params.update_conv_state(self.lidx_off + self.layer_idx, hidden_states, cache_position)
+            hidden_states = torch.sum(conv_state * self.conv1d.weight[:, 0, :], dim=-1)
+            if self.use_conv_bias:
+                hidden_states += self.conv1d.bias
+            hidden_states = self.act(hidden_states).to(hidden_states.dtype).unsqueeze(-1)   # (B, 2D, 1)
             
-        W = torch.cat([W, torch.ones((b, sl, 1), device=device)], dim=-1)                   # (B, L, 2D+1)
+        K = hidden_states.transpose(1, 2).contiguous()                                      # (B, L, 2D)
         
+        # Build delta_K
+        if is_prefill:
+            K = torch.cat([K_cache.unsqueeze(1), K], dim=1)                                 # (B, L+1, 2D)
+            delta_K = K[:, 1:, :] - K[:, :-1, :]                                            # (B, L, 2D)
+        else:
+            delta_K = K - K_cache.unsqueeze(1)                                              # (B, 1, 2D)
+            
         # Generate all operator matrices
-        B_E_out = self.B_E_fc(hidden_states).view(b, sl, self.ssm_size, 4 * d + 2)          # (B, L, K, 4D+2)
-        C_D_out = self.C_D_fc(hidden_states).view(b, sl, self.ssm_size, 4 * d)              # (B, L, K, 4D)
+        K_lag = K[:, :-1, :].view(b, -1, 1).repeat(1, 1, 4)                                 # (B, L*2D, 4)
+        op_mats = self.diff_proj_dn(self.act(self.diff_proj_up(K_lag)))                     # (B, L*2D, 4)
+        op_mats = torch.chunk(op_mats, chunks=4, dim=-1)                                    # (B, L*2D, 1) each
+        A, B, C, E = [mat.view(b, sl, self.im_size) for mat in op_mats]                     # (B, L, 2D)
 
-        A = self.A_fc(hidden_states).view(b, sl, 2 * d, self.ssm_size, self.ssm_size)       # (B, L, 2D, K, K)
-        B, E = torch.chunk(B_E_out, chunks=2, dim=-1)                                       # (B, L, K, 2D+1) each
-        C, D = torch.chunk(C_D_out, chunks=2, dim=-1)                                       # (B, L, K, 2D) each
-        D = D.transpose(2, 3).contiguous()                                                  # (B, L, 2D, K)
-        
+        # Start iteration
+        # TODO: Check if this computation is correct
         for i in range(sl):
-            x_CZ = torch.einsum("bkd,bd->bk", C[:, i, :, :], Z[:, i, :])                    # (B, K)
-            x_BW = torch.einsum("bkd,bd->bk", B[:, i, :, :], W[:, i, :])                    # (B, K)
-            update_1 = torch.einsum("bdij,bi,bj->bd", A[:, i, :, :, :], x_BW, x_CZ)         # (B, 2D)
+            M += (A[:, i, :] * delta_K[:, i, :] + B[:, i, :]) * M
+            M += C[:, i, :] * delta_K[:, i, :] + E[:, i, :]
+            M_buffer[:, i, :] = M
 
-            x_EW = torch.einsum("bkd,bd->bk", E[:, i, :, :], W[:, i, :])                    # (B, K)
-            update_2 = torch.einsum("bdk,bk->bd", D[:, i, :, :], x_EW)                      # (B, 2D)
-
-            if self.training:
-                Z[:, i+1, :] = Z[:, i, :] + update_1 + update_2
-            else:
-                Z[:, 0, :] = Z[:, 0, :] + update_1 + update_2
-
-        if cache_params is not None:
-            cache_params.update_lace_state(self.layer_idx, Z[:, 0, :], x_proj[:, 0, :])
+        if (not self.training) and (cache_params is not None):
+            cache_params.update_lace_state(self.layer_idx, M, K[:, -1, :])
         
-        if self.training:
-            Z = Z[:, 1:, :]
-                        
-        output_states = self.out_proj_fc2(self.act(self.out_proj_fc1(Z + y_proj)))
+        output_states = self.out_proj(M_buffer)
         return output_states
     
     
@@ -540,7 +547,6 @@ class LACEBlock(nn.Module):
         self.mixer = LACEMixer(config, layer_idx=layer_idx)
         
         # Config specific to LACE
-        self.do_residual = config.lace_do_residual
         self.norm_inputs = config.lace_norm_inputs
         
         if self.norm_inputs:
@@ -739,8 +745,8 @@ class FalconMambaModel(FalconMambaPreTrainedModel):
             [FalconMambaBlock(config, layer_idx=idx) for idx in range(config.num_hidden_layers)]
         )
         if config.lace_num_layers > 0:
-            for i in range(config.lace_num_layers):
-                self.layers.append(LACEBlock(config, layer_idx=i + config.num_hidden_layers))
+            for idx in range(config.lace_num_layers):
+                self.layers.append(LACEBlock(config, layer_idx=idx))
 
         self.gradient_checkpointing = False
         self.norm_f = FalconMambaRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)

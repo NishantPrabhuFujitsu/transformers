@@ -1844,7 +1844,7 @@ class MambaCache:
         self.conv_kernel_size = config.conv_kernel
 
         self.conv_states: torch.Tensor = torch.zeros(
-            config.num_hidden_layers,
+            config.num_hidden_layers + config.lace_num_layers,
             self.max_batch_size,
             self.intermediate_size,
             self.conv_kernel_size,
@@ -1860,16 +1860,16 @@ class MambaCache:
             dtype=dtype,
         )
         self.lace_states: torch.Tensor = torch.zeros(
-            config.num_hidden_layers,
+            config.lace_num_layers,
             self.max_batch_size,
-            self.ssm_state_size,
+            self.intermediate_size,
             device=device,
             dtype=dtype,
         )
         self.lace_last_inp_state: torch.Tensor = torch.zeros(
-            config.num_hidden_layers,
+            config.lace_num_layers,
             self.max_batch_size,
-            2 * self.hidden_size,
+            self.intermediate_size,
             device=device,
             dtype=dtype,
         )
