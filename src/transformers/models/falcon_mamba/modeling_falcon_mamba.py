@@ -14,6 +14,7 @@
 # limitations under the License.
 """PyTorch FALCONMAMBA model."""
 
+import time
 import math
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Union
@@ -450,6 +451,7 @@ class LACEMixer(nn.Module):
         self.hidden_size = config.hidden_size
         self.im_size = config.intermediate_size
         self.conv_kernel_size = config.conv_kernel
+        self.use_conv_bias = config.use_conv_bias
         self.ssm_size = config.state_size
         self.layer_idx = layer_idx
         self.activation = config.hidden_act
@@ -464,8 +466,8 @@ class LACEMixer(nn.Module):
             groups=self.im_size,
             padding=config.conv_kernel - 1,
         )
-        self.diff_proj_up = nn.Linear(4, self.ssm_size, bias=False)
-        self.diff_proj_dn = nn.Linear(self.ssm_size, 4, bias=False)
+        self.diff_proj_up = nn.Linear(1, self.ssm_size, bias=True)
+        self.diff_proj_dn = nn.Linear(self.ssm_size, 4, bias=True)
         self.out_proj = nn.Linear(self.im_size, self.hidden_size, bias=config.use_bias)
 
     def forward(
@@ -477,11 +479,10 @@ class LACEMixer(nn.Module):
     ):
         b, sl, _ = hidden_states.shape
         device = hidden_states.device
-        is_prefill = cache_position.shape[0] == self.conv_kernel_size
+        is_prefill = (cache_position is None) or (cache_position.shape[0] == self.conv_kernel_size)
         
         # Initialize ssm state from cache if available
         if is_prefill:
-            # TODO: Check if K_prev should still be proj of BOS embedding
             M = torch.zeros((b, self.im_size), dtype=hidden_states.dtype, device=device)
             K_cache = torch.zeros((b, self.im_size), dtype=hidden_states.dtype, device=device)
         else:
@@ -494,44 +495,46 @@ class LACEMixer(nn.Module):
             hidden_states = hidden_states * attention_mask.unsqueeze(-1)
         
         # Input projection
-        hidden_states = self.in_proj(hidden_states).transpose(1, 2).contiguous()            # (B, 2D, L)
+        hidden_states = self.in_proj(hidden_states).transpose(1, 2).contiguous()                # (B, 2D, L)
 
         # For convolution, during prefill we cache the last 3 time-steps of the input
         # This is done so that it can be appended as context to single tokens during decoding
-        if is_prefill:
-            conv_state = nn.functional.pad(hidden_states, (self.conv_kernel_size - hidden_states.shape[-1], 0))
-            cache_params.update_conv_state(self.lidx_off + self.layer_idx, conv_state, cache_position)
-            hidden_states = self.act(self.conv1d(hidden_states)[:, :, :sl])                 # (B, 2D, L)
+        if cache_params is not None:
+            if is_prefill:
+                conv_state = nn.functional.pad(hidden_states, (self.conv_kernel_size - hidden_states.shape[-1], 0))
+                cache_params.update_conv_state(self.lidx_off + self.layer_idx, conv_state, cache_position)
+                hidden_states = self.act(self.conv1d(hidden_states)[:, :, :sl])                 # (B, 2D, L)
+            else:
+                conv_state = cache_params.update_conv_state(self.lidx_off + self.layer_idx, hidden_states, cache_position)
+                hidden_states = torch.sum(conv_state * self.conv1d.weight[:, 0, :], dim=-1)
+                if self.use_conv_bias:
+                    hidden_states += self.conv1d.bias
+                hidden_states = self.act(hidden_states).to(hidden_states.dtype).unsqueeze(-1)   # (B, 2D, 1)
         else:
-            conv_state = cache_params.update_conv_state(self.lidx_off + self.layer_idx, hidden_states, cache_position)
-            hidden_states = torch.sum(conv_state * self.conv1d.weight[:, 0, :], dim=-1)
-            if self.use_conv_bias:
-                hidden_states += self.conv1d.bias
-            hidden_states = self.act(hidden_states).to(hidden_states.dtype).unsqueeze(-1)   # (B, 2D, 1)
+            hidden_states = self.act(self.conv1d(hidden_states)[:, :, :sl])                     # (B, 2D, L)                 
             
-        K = hidden_states.transpose(1, 2).contiguous()                                      # (B, L, 2D)
+        K = hidden_states.transpose(1, 2).contiguous()                                          # (B, L, 2D)
         
         # Build delta_K
         if is_prefill:
-            K = torch.cat([K_cache.unsqueeze(1), K], dim=1)                                 # (B, L+1, 2D)
-            delta_K = K[:, 1:, :] - K[:, :-1, :]                                            # (B, L, 2D)
+            K = torch.cat([K_cache.unsqueeze(1), K], dim=1)                                     # (B, L+1, 2D)
+            delta_K = K[:, 1:, :] - K[:, :-1, :]                                                # (B, L, 2D)
+            K_lag = K[:, :-1, :].view(b, -1, 1)                                                 # (B, L*2D, 1)
         else:
-            delta_K = K - K_cache.unsqueeze(1)                                              # (B, 1, 2D)
+            delta_K = K - K_cache.unsqueeze(1)                                                  # (B, 1, 2D)
+            K_lag = K_cache.view(b, -1, 1)                                                      # (B, 2D, 1)
             
         # Generate all operator matrices
-        K_lag = K[:, :-1, :].view(b, -1, 1).repeat(1, 1, 4)                                 # (B, L*2D, 4)
-        op_mats = self.diff_proj_dn(self.act(self.diff_proj_up(K_lag)))                     # (B, L*2D, 4)
-        op_mats = torch.chunk(op_mats, chunks=4, dim=-1)                                    # (B, L*2D, 1) each
-        A, B, C, E = [mat.view(b, sl, self.im_size) for mat in op_mats]                     # (B, L, 2D)
+        op_mats = self.diff_proj_dn(self.act(self.diff_proj_up(K_lag)))                         # (B, L*2D, 4)
+        op_mats = torch.chunk(op_mats, chunks=4, dim=-1)                                        # (B, L*2D, 1) each
+        A, B, C, E = [mat.view(b, sl, self.im_size) for mat in op_mats]                         # (B, L, 2D)
 
         # Start iteration
-        # TODO: Check if this computation is correct
         for i in range(sl):
-            M += (A[:, i, :] * delta_K[:, i, :] + B[:, i, :]) * M
-            M += C[:, i, :] * delta_K[:, i, :] + E[:, i, :]
+            M = M + (A[:, i, :] * delta_K[:, i, :] + B[:, i, :]) * M + C[:, i, :] * delta_K[:, i, :] + E[:, i, :]
             M_buffer[:, i, :] = M
 
-        if (not self.training) and (cache_params is not None):
+        if cache_params is not None:
             cache_params.update_lace_state(self.layer_idx, M, K[:, -1, :])
         
         output_states = self.out_proj(M_buffer)
@@ -551,6 +554,12 @@ class LACEBlock(nn.Module):
         
         if self.norm_inputs:
             self.norm = FalconMambaRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+            
+        for m in self.mixer.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.zeros_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
         
     def forward(
         self,
