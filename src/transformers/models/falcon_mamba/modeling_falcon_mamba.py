@@ -540,6 +540,114 @@ class LACEMixer(nn.Module):
         output_states = self.out_proj(M_buffer)
         return output_states
     
+
+class LinearDiscretizedLACEMixer(nn.Module):
+    
+    def __init__(self, config: FalconMambaConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.lidx_off = config.num_hidden_layers
+        self.hidden_size = config.hidden_size
+        self.im_size = config.lace_intermediate_size
+        self.conv_kernel_size = config.conv_kernel
+        self.use_conv_bias = config.use_conv_bias
+        self.ssm_size = config.state_size
+        self.layer_idx = layer_idx
+        self.activation = config.hidden_act
+        self.act = ACT2FN[config.hidden_act]
+        
+        self.in_proj = nn.Linear(self.hidden_size, self.im_size, bias=config.use_bias)
+        self.conv1d = nn.Conv1d(
+            in_channels=self.im_size,
+            out_channels=self.im_size,
+            bias=config.use_conv_bias,
+            kernel_size=config.conv_kernel,
+            groups=self.im_size,
+            padding=config.conv_kernel - 1,
+        )
+        self.coeff_proj = nn.Linear(self.hidden_size, 4 * self.hidden_size + 1, bias=True)
+        self.out_proj = nn.Linear(self.im_size, self.hidden_size, bias=config.use_bias)
+        
+    def forward(
+        self, 
+        hidden_states: torch.Tensor,
+        cache_params: Optional[MambaCache] = None,
+        cache_position: Optional[torch.LongTensor] = None, 
+        attention_mask: Optional[torch.LongTensor] = None
+    ):
+        b, sl, _ = hidden_states.shape
+        device = hidden_states.device
+        is_prefill = (cache_position is None) or (cache_position.shape[0] == self.conv_kernel_size)
+        
+        # Initialize ssm state from cache if available
+        if is_prefill:
+            Z = torch.zeros((b, self.im_size), dtype=hidden_states.dtype, device=device)
+            x_cache = torch.zeros((b, self.im_size), dtype=hidden_states.dtype, device=device)
+        else:
+            Z = cache_params.lace_states[self.layer_idx].clone().to(device)
+            x_cache = cache_params.lace_last_inp_state[self.layer_idx].clone().to(device)
+        
+        Z_buffer = torch.zeros((b, sl, self.im_size), dtype=hidden_states.dtype, device=device)
+        
+        if attention_mask is not None:
+            hidden_states = hidden_states * attention_mask.unsqueeze(-1)
+        
+        # Input projection
+        hidden_states = self.in_proj(hidden_states).transpose(1, 2).contiguous()                # (B, D, L)
+
+        # For convolution, during prefill we cache the last (kernel_size - 1) time-steps of the input
+        # This is done so that it can be appended as context to single tokens during decoding
+        if cache_params is not None:
+            if is_prefill:
+                conv_state = nn.functional.pad(hidden_states, (self.conv_kernel_size - hidden_states.shape[-1], 0))
+                cache_params.update_conv_state(self.lidx_off + self.layer_idx, conv_state, cache_position)
+                hidden_states = self.act(self.conv1d(hidden_states)[:, :, :sl])                 # (B, D, L)
+            else:
+                conv_state = cache_params.update_conv_state(self.lidx_off + self.layer_idx, hidden_states, cache_position)
+                hidden_states = torch.sum(conv_state * self.conv1d.weight[:, 0, :], dim=-1)
+                if self.use_conv_bias:
+                    hidden_states += self.conv1d.bias
+                hidden_states = self.act(hidden_states).to(hidden_states.dtype).unsqueeze(-1)   # (B, D, 1)
+        else:
+            hidden_states = self.act(self.conv1d(hidden_states)[:, :, :sl])                     # (B, D, L)                 
+            
+        x = hidden_states.transpose(1, 2).contiguous()                                          # (B, L, D)
+        
+        # Generate all coeff matrices
+        coeffs = self.coeff_proj(x)
+        Ax, Bx, Cx, Ex, delta = torch.split(coeffs, [x.shape[-1]] * 4 + [1], dim=-1)            # (B, L, D) x 4; (B, L, 1)
+        
+        # Build w
+        if is_prefill:
+            x = torch.cat([x_cache[:, None, :], x], dim=1)                                      # (B, L+1, D)
+            w = torch.div(x[:, 1:, :] - x[:, :-1, :], delta)                                    # (B, L, D)
+        else:
+            w = torch.div(x - x_cache[:, None, :], delta)                                       # (B, 1, D)
+            
+        # Generate coeffs with diff
+        coeffs = self.coeff_proj(w)
+        Aw, Bw, Cw, Ew, _ = torch.split(coeffs, [x.shape[-1]] * 4 + [1], dim=-1)                # (B,L,D) x 4, (B,L,1)
+            
+        # Compute J(delta)
+        J_delta = (
+            (delta * Ax * w) + (0.5 * Aw * w * delta.pow(2)) + 
+            (delta * Cx * w) + (0.5 * Cw * w * delta.pow(2))
+        )
+        
+        # The other integral calculation happens below
+        the_other_integral = None
+        
+        # Start iteration
+        for i in range(sl):
+            Z = J_delta * (Z + the_other_integral)
+            Z_buffer[:, i, :] = Z
+            
+        if cache_params is not None:
+            cache_params.update_lace_state(self.layer_idx, Z, x[:, -1, :])
+        
+        output_states = self.out_proj(Z_buffer)
+        return output_states
+    
     
 class LACEBlock(nn.Module):
     
