@@ -546,7 +546,6 @@ class LinearDiscretizedLACEMixer(nn.Module):
     def __init__(self, config: FalconMambaConfig, layer_idx: int):
         super().__init__()
         self.config = config
-        self.lidx_off = config.num_hidden_layers
         self.hidden_size = config.hidden_size
         self.im_size = config.lace_intermediate_size
         self.conv_kernel_size = config.conv_kernel
@@ -565,16 +564,16 @@ class LinearDiscretizedLACEMixer(nn.Module):
             groups=self.im_size,
             padding=config.conv_kernel - 1,
         )
-        self.coeff_proj = nn.Linear(self.hidden_size, 4 * self.hidden_size + 1, bias=True)
+        self.coeff_proj = nn.Linear(self.im_size, 4 * self.im_size + 1, bias=True)
         self.out_proj = nn.Linear(self.im_size, self.hidden_size, bias=config.use_bias)
-        
+      
     def forward(
         self, 
         hidden_states: torch.Tensor,
         cache_params: Optional[MambaCache] = None,
         cache_position: Optional[torch.LongTensor] = None, 
         attention_mask: Optional[torch.LongTensor] = None
-    ):
+    ):  
         b, sl, _ = hidden_states.shape
         device = hidden_states.device
         is_prefill = (cache_position is None) or (cache_position.shape[0] == self.conv_kernel_size)
@@ -600,10 +599,10 @@ class LinearDiscretizedLACEMixer(nn.Module):
         if cache_params is not None:
             if is_prefill:
                 conv_state = nn.functional.pad(hidden_states, (self.conv_kernel_size - hidden_states.shape[-1], 0))
-                cache_params.update_conv_state(self.lidx_off + self.layer_idx, conv_state, cache_position)
+                cache_params.update_lace_conv_state(self.layer_idx, conv_state, cache_position)
                 hidden_states = self.act(self.conv1d(hidden_states)[:, :, :sl])                 # (B, D, L)
             else:
-                conv_state = cache_params.update_conv_state(self.lidx_off + self.layer_idx, hidden_states, cache_position)
+                conv_state = cache_params.update_lace_conv_state(self.layer_idx, hidden_states, cache_position)
                 hidden_states = torch.sum(conv_state * self.conv1d.weight[:, 0, :], dim=-1)
                 if self.use_conv_bias:
                     hidden_states += self.conv1d.bias
@@ -614,32 +613,36 @@ class LinearDiscretizedLACEMixer(nn.Module):
         x = hidden_states.transpose(1, 2).contiguous()                                          # (B, L, D)
         
         # Generate all coeff matrices
-        coeffs = self.coeff_proj(x)
-        Ax, Bx, Cx, Ex, delta = torch.split(coeffs, [x.shape[-1]] * 4 + [1], dim=-1)            # (B, L, D) x 4; (B, L, 1)
+        x_coeffs = self.coeff_proj(x)
+        Ax, Bx, Cx, Ex, delta = torch.split(x_coeffs, [x.shape[-1]] * 4 + [1], dim=-1)            # (B, L, D) x 4; (B, L, 1)
         
         # Build w
         if is_prefill:
             x = torch.cat([x_cache[:, None, :], x], dim=1)                                      # (B, L+1, D)
-            w = torch.div(x[:, 1:, :] - x[:, :-1, :], delta)                                    # (B, L, D)
+            w = torch.div(x[:, 1:, :] - x[:, :-1, :], delta + 1e-10)                            # (B, L, D)
         else:
-            w = torch.div(x - x_cache[:, None, :], delta)                                       # (B, 1, D)
+            w = torch.div(x - x_cache[:, None, :], delta + 1e-10)                               # (B, 1, D)
             
         # Generate coeffs with diff
-        coeffs = self.coeff_proj(w)
-        Aw, Bw, Cw, Ew, _ = torch.split(coeffs, [x.shape[-1]] * 4 + [1], dim=-1)                # (B,L,D) x 4, (B,L,1)
-            
+        w_coeffs = self.coeff_proj(w)
+        Aw, Bw, Cw, Ew, _ = torch.split(w_coeffs, [x.shape[-1]] * 4 + [1], dim=-1)              # (B,L,D) x 4, (B,L,1)
+        
         # Compute J(delta)
         J_delta = (
             (delta * Ax * w) + (0.5 * Aw * w * delta.pow(2)) + 
             (delta * Cx * w) + (0.5 * Cw * w * delta.pow(2))
         )
         
-        # The other integral calculation happens below
-        the_other_integral = None
+        # The other integral term is approximated using Simpson's 1/3rd rule
+        intfunc = lambda s: (
+            ((Ax * w * s) + (0.5 * Aw * w * s**2) + (Cx * w * s + 0.5) * (Cw * w * s**2)) *
+            ((Bx * w) + Ex + (Bw * w * s) + (Ew * s))
+        )
+        integral = (delta / 6) * (intfunc(0) + 4 * intfunc(delta * 0.5) + intfunc(delta))
         
         # Start iteration
         for i in range(sl):
-            Z = J_delta * (Z + the_other_integral)
+            Z = J_delta[:, i, :] * (Z + integral[:, i, :])
             Z_buffer[:, i, :] = Z
             
         if cache_params is not None:
@@ -655,11 +658,14 @@ class LACEBlock(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.mixer = LACEMixer(config, layer_idx=layer_idx)
+        
+        if config.lace_use_linear_discretized:
+            self.mixer = LinearDiscretizedLACEMixer(config, layer_idx=layer_idx)
+        else:
+            self.mixer = LACEMixer(config, layer_idx=layer_idx)
         
         # Config specific to LACE
         self.norm_inputs = config.lace_norm_inputs
-        
         if self.norm_inputs:
             self.norm = FalconMambaRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
             

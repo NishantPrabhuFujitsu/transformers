@@ -128,6 +128,7 @@ class FalconMambaConfig(PretrainedConfig):
         use_mambapy=False,
         mixer_rms_eps=1e-6,
         lace_num_layers=0,
+        lace_use_linear_discretized=True,
         lace_intermediate_size=4096,
         lace_norm_inputs=False,
         **kwargs,
@@ -161,6 +162,7 @@ class FalconMambaConfig(PretrainedConfig):
         
         # For use with LACE
         self.lace_num_layers = lace_num_layers
+        self.lace_use_linear_discretized = lace_use_linear_discretized
         self.lace_intermediate_size = lace_intermediate_size
         self.lace_norm_inputs = lace_norm_inputs
 
