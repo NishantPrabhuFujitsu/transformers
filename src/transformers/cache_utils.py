@@ -1845,7 +1845,7 @@ class MambaCache:
         self.conv_kernel_size = config.conv_kernel
 
         self.conv_states: torch.Tensor = torch.zeros(
-            config.num_hidden_layers,
+            config.num_hidden_layers + config.lace_num_layers,
             self.max_batch_size,
             self.intermediate_size,
             self.conv_kernel_size,
@@ -1853,32 +1853,17 @@ class MambaCache:
             dtype=dtype,
         )
         self.ssm_states: torch.Tensor = torch.zeros(
-            config.num_hidden_layers,
+            config.num_hidden_layers + config.lace_num_layers,
             self.max_batch_size,
             self.intermediate_size,
             self.ssm_state_size,
             device=device,
             dtype=dtype,
         )
-        self.lace_conv_states: torch.Tensor = torch.zeros(
-            config.lace_num_layers,
-            self.max_batch_size,
-            self.lace_intermediate_size,
-            self.conv_kernel_size,
-            device=device,
-            dtype=dtype,
-        )
-        self.lace_states: torch.Tensor = torch.zeros(
-            config.lace_num_layers,
-            self.max_batch_size,
-            self.lace_intermediate_size,
-            device=device,
-            dtype=dtype,
-        )
         self.lace_last_inp_state: torch.Tensor = torch.zeros(
             config.lace_num_layers,
             self.max_batch_size,
-            self.lace_intermediate_size,
+            self.intermediate_size,
             device=device,
             dtype=dtype,
         )
@@ -1898,25 +1883,12 @@ class MambaCache:
         self.conv_states[layer_idx] += conv_state
         return self.conv_states[layer_idx]
     
-    def update_lace_conv_state(
-        self, layer_idx: int, new_conv_state: torch.Tensor, cache_position: torch.LongTensor
-    ) -> torch.Tensor:
-        conv_state = self.lace_conv_states[layer_idx]
-        cache_position = cache_position.clamp(0, self.conv_kernel_size - 1)
-
-        conv_state = conv_state.roll(shifts=-1, dims=-1)
-        conv_state[:, :, cache_position] = new_conv_state.to(device=conv_state.device, dtype=conv_state.dtype)
-        self.lace_conv_states[layer_idx].zero_()
-        self.lace_conv_states[layer_idx] += conv_state
-        return self.lace_conv_states[layer_idx]
-
     def update_ssm_state(self, layer_idx: int, new_ssm_state: torch.Tensor):
         self.ssm_states[layer_idx] = new_ssm_state.to(self.ssm_states.device)
         return self.ssm_states[layer_idx]
     
-    def update_lace_state(self, layer_idx: int, new_lace_state: torch.Tensor, last_inp_state: torch.Tensor):
-        self.lace_states[layer_idx] = new_lace_state.to(self.lace_states.device)
-        self.lace_last_inp_state[layer_idx] = last_inp_state.to(self.lace_last_inp_state.device)
+    def update_lace_last_inp(self, layer_idx: int, last_inp: torch.Tensor):
+        self.lace_last_inp_state[layer_idx] = last_inp.to(self.lace_last_inp_state.device)
         return self.lace_states[layer_idx]
 
     def reset(self):

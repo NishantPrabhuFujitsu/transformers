@@ -495,7 +495,7 @@ class LACEMixer(nn.Module):
             hidden_states = hidden_states * attention_mask.unsqueeze(-1)
         
         # Input projection
-        hidden_states = self.in_proj(hidden_states).transpose(1, 2).contiguous()                # (B, 2D, L)
+        hidden_states = self.in_proj(hidden_states).transpose(1, 2).contiguous()            # (B, L, 2D)
 
         # For convolution, during prefill we cache the last 3 time-steps of the input
         # This is done so that it can be appended as context to single tokens during decoding
@@ -548,14 +548,17 @@ class LinearDiscretizedLACEMixer(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.im_size = config.lace_intermediate_size
+        self.time_step_rank = config.time_step_rank
         self.conv_kernel_size = config.conv_kernel
         self.use_conv_bias = config.use_conv_bias
         self.ssm_size = config.state_size
         self.layer_idx = layer_idx
+        self.rms_eps = config.mixer_rms_eps
+        self.normalize_rms = config.lace_do_internal_rms
         self.activation = config.hidden_act
         self.act = ACT2FN[config.hidden_act]
         
-        self.in_proj = nn.Linear(self.hidden_size, self.im_size, bias=config.use_bias)
+        self.in_proj = nn.Linear(self.hidden_size, 2 * self.im_size, bias=config.use_bias)
         self.conv1d = nn.Conv1d(
             in_channels=self.im_size,
             out_channels=self.im_size,
@@ -564,7 +567,8 @@ class LinearDiscretizedLACEMixer(nn.Module):
             groups=self.im_size,
             padding=config.conv_kernel - 1,
         )
-        self.coeff_proj = nn.Linear(self.im_size, 4 * self.im_size + 1, bias=True)
+        self.coeff_proj = nn.Linear(self.im_size, 4 * self.im_size + self.time_step_rank, bias=True)
+        self.dt_proj = nn.Linear(self.time_step_rank, self.im_size, bias=True)
         self.out_proj = nn.Linear(self.im_size, self.hidden_size, bias=config.use_bias)
       
     def forward(
@@ -592,7 +596,9 @@ class LinearDiscretizedLACEMixer(nn.Module):
             hidden_states = hidden_states * attention_mask.unsqueeze(-1)
         
         # Input projection
-        hidden_states = self.in_proj(hidden_states).transpose(1, 2).contiguous()                # (B, D, L)
+        proj_states = self.in_proj(hidden_states)
+        hidden_states, gate = proj_states.chunk(2, dim=-1)
+        hidden_states = hidden_states.transpose(1, 2).contiguous()
 
         # For convolution, during prefill we cache the last (kernel_size - 1) time-steps of the input
         # This is done so that it can be appended as context to single tokens during decoding
@@ -614,7 +620,8 @@ class LinearDiscretizedLACEMixer(nn.Module):
         
         # Generate all coeff matrices
         x_coeffs = self.coeff_proj(x)
-        Ax, Bx, Cx, Ex, delta = torch.split(x_coeffs, [x.shape[-1]] * 4 + [1], dim=-1)            # (B, L, D) x 4; (B, L, 1)
+        Ax, Bx, Cx, Ex, dt = torch.split(x_coeffs, [self.im_size] * 4 + [self.time_step_rank], dim=-1)
+        delta = nn.functional.softplus(self.dt_proj(dt))
         
         # Build w
         if is_prefill:
@@ -625,7 +632,12 @@ class LinearDiscretizedLACEMixer(nn.Module):
             
         # Generate coeffs with diff
         w_coeffs = self.coeff_proj(w)
-        Aw, Bw, Cw, Ew, _ = torch.split(w_coeffs, [x.shape[-1]] * 4 + [1], dim=-1)              # (B,L,D) x 4, (B,L,1)
+        Aw, Bw, Cw, Ew, _ = torch.split(w_coeffs, [self.im_size] * 4 + [self.time_step_rank], dim=-1)
+
+        # Apply rms if requested    
+        if self.normalize_rms:    
+            for t in [Ax, Bx, Cx, Ex, Aw, Bw, Cw, Ew, delta]:
+                t = rms_forward(t, variance_epsilon=self.rms_eps)
         
         # Compute J(delta)
         J_delta = (
@@ -648,9 +660,143 @@ class LinearDiscretizedLACEMixer(nn.Module):
         if cache_params is not None:
             cache_params.update_lace_state(self.layer_idx, Z, x[:, -1, :])
         
+        Z_buffer = Z_buffer * self.act(gate)
         output_states = self.out_proj(Z_buffer)
         return output_states
     
+
+class LinearDiscretizedLACEMixerV2(nn.Module):
+
+    def __init__(self, config: FalconMambaConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.ssm_state_size = config.state_size
+        self.conv_kernel_size = config.conv_kernel
+        self.intermediate_size = config.intermediate_size
+        self.lidx_offset = config.num_hidden_layers
+        self.layer_idx = layer_idx
+        self.use_conv_bias = config.use_conv_bias
+        self.conv1d = nn.Conv1d(
+            in_channels=self.intermediate_size,
+            out_channels=self.intermediate_size,
+            bias=config.use_conv_bias,
+            kernel_size=config.conv_kernel,
+            groups=self.intermediate_size,
+            padding=config.conv_kernel - 1,
+        )
+
+        self.activation = config.hidden_act
+        self.act = ACT2FN[config.hidden_act]
+
+        # projection of the input hidden states
+        self.in_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.use_bias)
+        # [LACE] Generate dt and M; M is needed during iterations to bring scan_output to correct shape
+        self.x_proj = nn.Linear(self.intermediate_size, self.intermediate_size + self.ssm_state_size, bias=False)
+
+        # S4D real initialization. These are not discretized!
+        # The core is to load them, compute the discrete states, then write the updated state. Keeps the memory bounded
+        A = torch.arange(1, self.ssm_state_size + 1, dtype=torch.float32)[None, :]
+        A = A.expand(self.intermediate_size, -1).contiguous()
+        self.A_log = nn.Parameter(torch.log(A))
+        
+        # [LACE] C and E
+        self.C = torch.ones(self.intermediate_size, dtype=torch.float32)
+        self.E = torch.ones(self.intermediate_size, dtype=torch.float32) 
+
+        self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.use_bias)
+        self.use_bias = config.use_bias
+        self.rms_eps = config.mixer_rms_eps
+
+    def forward(
+        self,
+        input_states,
+        cache_params: Optional[MambaCache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.LongTensor] = None,
+    ):
+        batch_size, seq_len, _ = input_states.shape
+        dtype = input_states.dtype
+        # 1. Gated MLP's linear projection
+        hidden_states = self.in_proj(input_states).transpose(1, 2)                          # [B, 2D, L]
+
+        if attention_mask is not None:
+            hidden_states = hidden_states * attention_mask.unsqueeze(1)
+
+        # 2. Convolution sequence transformation
+        if cache_params is not None:
+            ssm_state = cache_params.ssm_states[self.lidx_offset + self.layer_idx].clone()
+            ssm_state = ssm_state.to(hidden_states.device)                                  # [B, 2D, S]
+            
+            # [LACE] Last input state from cache
+            last_inp = cache_params.lace_last_inp_state[self.layer_idx].clone().unsqueeze(-1)
+            last_inp = last_inp.to(hidden_states.device)                                    # [B, 2D, 1]
+            
+            # use `cache_position.shape[0]` to check whether we are in prefill
+            # stage, it's equivalent to check `cache_position[0] == 0`, which
+            # breaks dynamo fullgraph constraints
+            if cache_position is not None and cache_position.shape[0] == self.conv_kernel_size:
+                conv_state = nn.functional.pad(hidden_states, (self.conv_kernel_size - hidden_states.shape[-1], 0))
+                cache_params.update_conv_state(self.lidx_offset + self.layer_idx, conv_state, cache_position)
+                hidden_states = self.act(self.conv1d(hidden_states)[..., :seq_len])         # [B, 2D, L]
+            else:
+                conv_state = cache_params.update_conv_state(self.lidx_offset + self.layer_idx, hidden_states, cache_position)
+                hidden_states = torch.sum(conv_state * self.conv1d.weight[:, 0, :], dim=-1)
+                if self.use_conv_bias:
+                    hidden_states += self.conv1d.bias
+                hidden_states = self.act(hidden_states).to(dtype).unsqueeze(-1)             # [B, 2D, 1] : decoding
+        else:
+            ssm_state = torch.zeros(
+                (batch_size, self.intermediate_size, self.ssm_state_size), device=hidden_states.device, dtype=dtype
+            )
+            last_inp = torch.zeros(
+                (batch_size, self.intermediate_size, seq_len), device=hidden_states.device, dtype=dtype
+            )
+            hidden_states = self.act(self.conv1d(hidden_states)[..., :seq_len])             # [B, 2D, L]
+
+        if attention_mask is not None:
+            hidden_states = hidden_states * attention_mask.unsqueeze(1)
+
+        # 3. State Space Model sequence transformation
+        # 3.a. Selection:  [B, L, 2D + S]
+        ssm_parameters = self.x_proj(hidden_states.transpose(1, 2))
+        time_step, M = torch.split(ssm_parameters, [self.intermediate_size, self.ssm_state_size], dim=-1)
+
+        M = rms_forward(M, variance_epsilon=self.rms_eps)                                   # [B, L, S]
+        time_step = rms_forward(time_step, variance_epsilon=self.rms_eps)
+        discrete_time_step = nn.functional.softplus(time_step).transpose(1, 2)              # [B, 2D, L]
+
+        # Define W and B
+        h_with_cache = torch.cat([last_inp, hidden_states], dim=-1)
+        W = torch.div(h_with_cache[:, :, 1:] - h_with_cache[:, :, :-1], discrete_time_step) # [B, 2D, L]
+        B = self.E[None, :, None] * W + self.C[None, :, None]                               # [B, 2D, L]
+        
+        # 3.b. Discretization
+        A = -torch.exp(self.A_log.float())                                                  # [2D, S]
+        discrete_A = torch.exp(A[None, :, None, :] * discrete_time_step[:, :, :, None])     # [B, 2D, L, S]
+        discrete_B = discrete_time_step[:, :, :, None] * B[:, None, :, :].float()           # [B, 2D, L, S]
+        deltaB_u = discrete_B * hidden_states[:, :, :, None].float()                        # [B, 2D, L, S]
+
+        # 3.c perform the recurrence y ← SSM(A, B, C)(x)
+        if self.use_mambapy and self.training and cache_params is None:
+            hs = pscan(discrete_A.transpose(1, 2), deltaB_u.transpose(1, 2))                # [B, L, 2D, S]
+            scan_output = (hs @ M.unsqueeze(-1)).squeeze(3).transpose(1, 2)                 # [B, 2D, L]
+        else:
+            scan_outputs = []
+            for i in range(seq_len):
+                ssm_state = discrete_A[:, :, i, :] * ssm_state + deltaB_u[:, :, i, :]       # [B, 2D, S]
+                scan_output = torch.matmul(ssm_state.to(dtype), M[:, i, :].unsqueeze(-1))   # [B, 2D, 1]
+                scan_outputs.append(scan_output[:, :, 0])
+            scan_output = torch.stack(scan_outputs, dim=-1)                                 # [B, 2D, L]
+
+            if cache_params is not None:
+                cache_params.update_ssm_state(self.layer_idx, ssm_state)
+                cache_params.update_lace_last_inp(self.layer_idx, hidden_states[:, :, -1])
+
+        # 4. Final linear projection
+        contextualized_states = self.out_proj(scan_output.transpose(1, 2))                  # [B, L, D]
+        return contextualized_states
+
     
 class LACEBlock(nn.Module):
     
@@ -660,7 +806,7 @@ class LACEBlock(nn.Module):
         self.layer_idx = layer_idx
         
         if config.lace_use_linear_discretized:
-            self.mixer = LinearDiscretizedLACEMixer(config, layer_idx=layer_idx)
+            self.mixer = LinearDiscretizedLACEMixerV2(config, layer_idx=layer_idx)
         else:
             self.mixer = LACEMixer(config, layer_idx=layer_idx)
         
@@ -669,12 +815,6 @@ class LACEBlock(nn.Module):
         if self.norm_inputs:
             self.norm = FalconMambaRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
             
-        for m in self.mixer.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.zeros_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-        
     def forward(
         self,
         hidden_states,
