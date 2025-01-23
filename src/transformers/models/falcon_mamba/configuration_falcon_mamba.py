@@ -117,7 +117,7 @@ class FalconMambaConfig(PretrainedConfig):
         hidden_act="silu",
         initializer_range=0.1,
         residual_in_fp32=True,
-        time_step_rank="auto", # 512
+        time_step_rank="auto",
         time_step_scale=1.0,
         time_step_min=0.001,
         time_step_max=0.1,
@@ -129,7 +129,6 @@ class FalconMambaConfig(PretrainedConfig):
         mixer_rms_eps=1e-6,
         lace_num_layers=0,
         lace_use_linear_discretized=True,
-        lace_norm_inputs=False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -163,6 +162,5 @@ class FalconMambaConfig(PretrainedConfig):
         # For use with LACE
         self.lace_num_layers = lace_num_layers
         self.lace_use_linear_discretized = lace_use_linear_discretized
-        self.lace_norm_inputs = lace_norm_inputs
 
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, pad_token_id=pad_token_id, **kwargs)
