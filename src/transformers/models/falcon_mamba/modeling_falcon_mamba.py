@@ -729,7 +729,7 @@ class LACEBlock(nn.Module):
         self.residual_in_fp32 = config.residual_in_fp32
         
         self.norm = FalconMambaRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.mixer = LinearDiscretizedLACEMixerV3(config, layer_idx=layer_idx)
+        self.mixer = LinearDiscretizedLACEMixerV2(config, layer_idx=layer_idx)
         
     def forward(
         self,
