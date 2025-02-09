@@ -485,6 +485,10 @@ class LinearDiscretizedLACEMixerV2(nn.Module):
         self.rms_eps = config.mixer_rms_eps
         self.use_mambapy = config.use_mambapy
 
+        # Using this for training, remove once done
+        self.h_cache = self.register_buffer("h_cache", None)
+        self.y_cache = self.register_buffer("y_cache", None)
+
     def forward(
         self,
         input_states,
@@ -530,6 +534,9 @@ class LinearDiscretizedLACEMixerV2(nn.Module):
 
         if attention_mask is not None:
             hidden_states = hidden_states * attention_mask.unsqueeze(1)
+            
+        # CACHE: hidden states
+        self.h_cache = hidden_states.detach().clone()
 
         # 3. State Space Model sequence transformation
         # 3.a. Selection:  [B, L, 2D + S + S]
@@ -577,6 +584,9 @@ class LinearDiscretizedLACEMixerV2(nn.Module):
             if cache_params is not None:
                 cache_params.update_ssm_state(self.lidx_offset + self.layer_idx, ssm_state)
                 cache_params.update_lace_last_inp(self.layer_idx, hidden_states[:, :, -1])
+                
+        # CACHE: scan output
+        self.y_cache = scan_output.detach().clone()
 
         # 4. Final linear projection
         contextualized_states = self.out_proj(scan_output.transpose(1, 2))                      # [B, L, D]
