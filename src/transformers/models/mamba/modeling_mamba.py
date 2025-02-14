@@ -505,10 +505,7 @@ class LACEMixer(nn.Module):
         W = torch.div(h_with_cache[:, :, 1:] - h_with_cache[:, :, :-1], discrete_time_step)     # [B, 2D, L]
         W = rms_forward(W)
         
-        if self.config.lace_use_linear_discretized:
-            M = self.E[None, :, None, :] * W[:, :, :, None] + B[:, None, :, :]                  # [B, 2D, L, S]
-        else:
-            M = B[:, None, :, :]
+        M = self.E[None, :, None, :] * W[:, :, :, None] + B[:, None, :, :]                      # [B, 2D, L, S]
             
         # 3.b. Discretization
         A = -torch.exp(self.A_log.float())                                                      # [2D, S]
