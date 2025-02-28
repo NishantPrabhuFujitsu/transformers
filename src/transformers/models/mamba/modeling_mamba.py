@@ -312,7 +312,7 @@ class MambaMixer(nn.Module):
             if cache_params is not None:
                 cache_params.ssm_states[self.layer_idx].copy_(ssm_state)
                 
-        self.ssm_out_cache = scan_output.detach().clone()
+        self.ssm_out_cache = scan_output
 
         # 4. Final linear projection
         contextualized_states = self.out_proj(scan_output.transpose(1, 2))  # [batch, seq_len, hidden_size]
@@ -534,7 +534,7 @@ class LACEMixer(nn.Module):
                 cache_params.update_lace_last_inp(self.layer_idx, hidden_states[:, :, -1])
                 
         # CACHE: scan output
-        self.ssm_out_cache = scan_output.detach().clone()
+        self.ssm_out_cache = scan_output
 
         # 4. Final linear projection
         contextualized_states = self.out_proj(scan_output.transpose(1, 2))                      # [B, L, D]
