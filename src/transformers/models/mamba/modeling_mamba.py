@@ -132,7 +132,8 @@ class MambaMixer(nn.Module):
                     " https://github.com/Dao-AILab/causal-conv1d. For the mamba.py backend, follow https://github.com/alxndrTL/mamba.py."
                 )
         
-        self.ssm_out_cache = self.register_buffer("ssm_out_cache", None)
+        self.ssm_inp_cache = self.register_buffer("ssm_inp_cache", None, persistent=False)
+        self.ssm_out_cache = self.register_buffer("ssm_out_cache", None, persistent=False)
 
     def cuda_kernels_forward(
         self,
@@ -279,6 +280,8 @@ class MambaMixer(nn.Module):
 
         # 3. State Space Model sequence transformation
         # 3.a. Selection:  [batch, seq_len, self.time_step_rank + self.ssm_state_size * 2]
+        self.ssm_inp_cache = hidden_states.detach()
+        
         ssm_parameters = self.x_proj(hidden_states.transpose(1, 2))
         time_step, B, C = torch.split(
             ssm_parameters, [self.time_step_rank, self.ssm_state_size, self.ssm_state_size], dim=-1
@@ -297,6 +300,10 @@ class MambaMixer(nn.Module):
             hs = pscan(discrete_A.transpose(1, 2), deltaB_u.transpose(1, 2)) # [batch, seq_len, intermediate_size, ssm_state_size]
 
             scan_output = (hs @ C.unsqueeze(-1)).squeeze(3).transpose(1, 2) # [batch, intermediate_size, seq_len]
+            
+            # KD
+            self.ssm_out_cache = scan_output.detach()
+            
             scan_output = scan_output + hidden_states * self.D[None, :, None]
             scan_output = scan_output * self.act(gate)
         else:
@@ -306,14 +313,16 @@ class MambaMixer(nn.Module):
                 scan_output = torch.matmul(ssm_state.to(dtype), C[:, i, :].unsqueeze(-1))  # [batch, intermediade_size, 1]
                 scan_outputs.append(scan_output[:, :, 0])
             scan_output = torch.stack(scan_outputs, dim=-1)                                # [batch, seq_len, intermediade_size]
+            
+            # KD
+            self.ssm_out_cache = scan_output.detach()
+            
             scan_output = scan_output + (hidden_states * self.D[None, :, None])
             scan_output = (scan_output * self.act(gate))
 
             if cache_params is not None:
                 cache_params.ssm_states[self.layer_idx].copy_(ssm_state)
                 
-        self.ssm_out_cache = scan_output
-
         # 4. Final linear projection
         contextualized_states = self.out_proj(scan_output.transpose(1, 2))  # [batch, seq_len, hidden_size]
         return contextualized_states
@@ -440,9 +449,6 @@ class LACEMixer(nn.Module):
         self.use_bias = config.use_bias
         self.use_mambapy = config.use_mambapy
 
-        # Using this for training, remove once done
-        self.ssm_out_cache = self.register_buffer("ssm_out_cache", None)
-
     def forward(
         self,
         input_states,
@@ -502,30 +508,28 @@ class LACEMixer(nn.Module):
 
         # Define W and B
         h_with_cache = torch.cat([last_inp, hidden_states], dim=-1)
-        W = torch.div(h_with_cache[:, :, 1:] - h_with_cache[:, :, :-1], discrete_time_step)     # [B, 2D, L]
-        W = rms_forward(W)
+        W = rms_forward(h_with_cache[:, :, 1:] - h_with_cache[:, :, :-1])
+        M = self.E[None, :, None, :] * W[:, :, :, None]
         
-        M = self.E[None, :, None, :] * W[:, :, :, None] + B[:, None, :, :]                      # [B, 2D, L, S]
-            
         # 3.b. Discretization
-        A = -torch.exp(self.A_log.float())                                                      # [2D, S]
-        discrete_A = torch.exp(A[None, :, None, :] * discrete_time_step[:, :, :, None])         # [B, 2D, L, S]
-        discrete_B = discrete_time_step[:, :, :, None] * M.float()                              # [B, 2D, L, S]
-        deltaB_u = discrete_B * hidden_states[:, :, :, None].float()                            # [B, 2D, L, S]
-
+        A = -torch.exp(self.A_log.float())
+        discrete_A = torch.exp(A[None, :, None, :] * discrete_time_step[:, :, :, None])
+        discrete_B = M.float() + discrete_time_step[:, :, :, None] * B[:, None, :, :].float()
+        deltaB_u = discrete_B * hidden_states[:, :, :, None].float()
+        
         # 3.c perform the recurrence y ← SSM(A, B)(x)
         if self.use_mambapy and cache_params is None:
-            hs = pscan(discrete_A.transpose(1, 2), deltaB_u.transpose(1, 2))                    # [B, L, 2D, S]
-            scan_output = hs.sum(dim=-1).transpose(1, 2)   
+            hs = pscan(discrete_A.transpose(1, 2), deltaB_u.transpose(1, 2))
+            scan_output = hs.sum(dim=-1).transpose(1, 2)
             scan_output = scan_output + hidden_states * self.D[None, :, None]
             scan_output = scan_output * self.act(gate)
         else:
             scan_outputs = []
             for i in range(seq_len):
-                ssm_state = discrete_A[:, :, i, :] * ssm_state + deltaB_u[:, :, i, :]           # [B, 2D, S]
+                ssm_state = discrete_A[:, :, i, :] * ssm_state + deltaB_u[:, :, i, :]
                 scan_output = ssm_state.to(dtype).sum(-1).unsqueeze(-1)
                 scan_outputs.append(scan_output[:, :, 0])
-            scan_output = torch.stack(scan_outputs, dim=-1)                                     # [B, 2D, L]
+            scan_output = torch.stack(scan_outputs, dim=-1)
             scan_output = scan_output + hidden_states * self.D[None, :, None]
             scan_output = scan_output * self.act(gate)
             

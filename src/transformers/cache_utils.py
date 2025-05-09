@@ -1866,13 +1866,10 @@ class MambaCache:
             device=device,
             dtype=dtype,
         )
-
         torch._dynamo.mark_static_address(self.conv_states)
         torch._dynamo.mark_static_address(self.ssm_states)
 
-    def update_conv_state(
-        self, layer_idx: int, new_conv_state: torch.Tensor, cache_position: torch.LongTensor
-    ) -> torch.Tensor:
+    def update_conv_state(self, layer_idx: int, new_conv_state: torch.Tensor, cache_position: torch.LongTensor):
         conv_state = self.conv_states[layer_idx]
         cache_position = cache_position.clamp(0, self.conv_kernel_size - 1)
 
@@ -1889,11 +1886,11 @@ class MambaCache:
     def update_lace_last_inp(self, layer_idx: int, last_inp: torch.Tensor):
         self.lace_last_inp_state[layer_idx] = last_inp.to(self.lace_last_inp_state.device)
         return self.lace_last_inp_state[layer_idx]
-
+            
     def reset(self):
         self.conv_states.zero_()
         self.ssm_states.zero_()
-
+        
     @property
     def batch_size(self):
         logger.warning_once(

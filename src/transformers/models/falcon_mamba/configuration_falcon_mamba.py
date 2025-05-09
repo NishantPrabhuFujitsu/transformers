@@ -128,7 +128,7 @@ class FalconMambaConfig(PretrainedConfig):
         use_mambapy=False,
         mixer_rms_eps=1e-6,
         lace_num_layers=0,
-        lace_use_linear_discretized=True,
+        lace_w_norm_winsize=128,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -161,6 +161,6 @@ class FalconMambaConfig(PretrainedConfig):
         
         # For use with LACE
         self.lace_num_layers = lace_num_layers
-        self.lace_use_linear_discretized = lace_use_linear_discretized
+        self.lace_w_norm_winsize = lace_w_norm_winsize
 
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, pad_token_id=pad_token_id, **kwargs)
