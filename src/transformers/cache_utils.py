@@ -1866,6 +1866,14 @@ class MambaCache:
             device=device,
             dtype=dtype,
         )
+        self.lace_w_sq_sum: torch.Tensor = torch.zeros(
+            config.lace_num_layers,
+            self.max_batch_size,
+            self.intermediate_size,
+            device=device,
+            dtype=dtype,
+        )
+        self.lace_w_norm_count: int = 0
 
         torch._dynamo.mark_static_address(self.conv_states)
         torch._dynamo.mark_static_address(self.ssm_states)
@@ -1889,7 +1897,16 @@ class MambaCache:
     def update_lace_last_inp(self, layer_idx: int, last_inp: torch.Tensor):
         self.lace_last_inp_state[layer_idx] = last_inp.to(self.lace_last_inp_state.device)
         return self.lace_last_inp_state[layer_idx]
-
+    
+    def update_w_norm(self, layer_idx: int, w: torch.Tensor, count: int, mode: str = "acc"):                 
+        if mode == "acc":
+            self.lace_w_sq_sum[layer_idx] += w.pow(2)
+            self.lace_w_norm_count += 1
+        elif mode == "set":
+            self.lace_w_sq_sum[layer_idx] = w
+            self.lace_w_norm_count = count
+        return self.lace_w_sq_sum[layer_idx], self.lace_w_norm_count
+    
     def reset(self):
         self.conv_states.zero_()
         self.ssm_states.zero_()
