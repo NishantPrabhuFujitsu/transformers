@@ -1845,9 +1845,9 @@ class MambaCache:
 
         self.conv_states: torch.Tensor = torch.zeros(
             config.num_hidden_layers + config.lace_num_layers,
+            self.conv_kernel_size,
             self.max_batch_size,
             self.intermediate_size,
-            self.conv_kernel_size,
             device=device,
             dtype=dtype,
         )
@@ -1855,7 +1855,6 @@ class MambaCache:
             config.num_hidden_layers + config.lace_num_layers,
             self.max_batch_size,
             self.intermediate_size,
-            self.ssm_state_size,
             device=device,
             dtype=dtype,
         )
@@ -1884,8 +1883,8 @@ class MambaCache:
         conv_state = self.conv_states[layer_idx]
         cache_position = cache_position.clamp(0, self.conv_kernel_size - 1)
 
-        conv_state = conv_state.roll(shifts=-1, dims=-1)
-        conv_state[:, :, cache_position] = new_conv_state.to(device=conv_state.device, dtype=conv_state.dtype)
+        conv_state = conv_state.roll(shifts=-1, dims=0)
+        conv_state[cache_position, :, :] = new_conv_state.to(device=conv_state.device, dtype=conv_state.dtype)
         self.conv_states[layer_idx].zero_()
         self.conv_states[layer_idx] += conv_state
         return self.conv_states[layer_idx]
@@ -1897,16 +1896,7 @@ class MambaCache:
     def update_lace_last_inp(self, layer_idx: int, last_inp: torch.Tensor):
         self.lace_last_inp_state[layer_idx] = last_inp.to(self.lace_last_inp_state.device)
         return self.lace_last_inp_state[layer_idx]
-    
-    def update_w_norm(self, layer_idx: int, w: torch.Tensor, count: int, mode: str = "acc"):                 
-        if mode == "acc":
-            self.lace_w_sq_sum[layer_idx] += w.pow(2)
-            self.lace_w_norm_count += 1
-        elif mode == "set":
-            self.lace_w_sq_sum[layer_idx] = w
-            self.lace_w_norm_count = count
-        return self.lace_w_sq_sum[layer_idx], self.lace_w_norm_count
-    
+
     def reset(self):
         self.conv_states.zero_()
         self.ssm_states.zero_()
@@ -1918,6 +1908,142 @@ class MambaCache:
             "v4.49. Use the more precisely named 'self.max_batch_size' attribute instead."
         )
         return self.max_batch_size
+    
+    
+# class MambaCache:
+#     """
+#     Cache for mamba model which does not have attention mechanism and key value states.
+
+#     Arguments:
+#         config (`PretrainedConfig):
+#             The configuration file defining the shape-related attributes required to initialize the static cache.
+#         batch_size (`int`):
+#             The batch size with which the model will be used. Note that a new instance must be instantiated if a
+#             smaller batch size is used.
+#         dtype (`torch.dtype`, *optional*, defaults to `torch.float16`):
+#             The default `dtype` to use when initializing the layer.
+#         device (`torch.device` or `str`, *optional*):
+#             The device on which the cache should be initialized. Should be the same as the layer.
+
+#     Attributes:
+#         dtype: (`torch.dtype`):
+#             The default `dtype` used to initializing the cache.
+#         intermediate_size: (`int`):
+#             Model's intermediate_size taken from config.
+#         ssm_state_size: (`int`):
+#             Model's state_size taken from config.
+#         conv_kernel_size: (`int`):
+#             Model's convolution kernel size taken from config
+#         conv_states: (`torch.Tensor`):
+#             A tensor of shape `[layer_idx, batch_size, intermediate_size, conv_kernel_size]` that holds convolutional states.
+#         ssm_states: (`torch.Tensor`):
+#             A tensor of shape `[layer_idx, batch_size, intermediate_size, ssm_state_size]` that holds ssm states
+
+#     Example:
+
+#         ```python
+#         >>> from transformers import AutoTokenizer, MambaForCausalLM, MambaCache
+
+#         >>> model = MambaForCausalLM.from_pretrained("state-spaces/mamba-130m-hf")
+#         >>> tokenizer = AutoTokenizer.from_pretrained("state-spaces/mamba-130m-hf")
+
+#         >>> inputs = tokenizer(text="My name is Mamba", return_tensors="pt")
+
+#         >>> # Prepare a cache class and pass it to model's forward
+#         >>> past_key_values = MambaCache(config=model.config, batch_size=1, device=model.device, dtype=model.dtype)
+#         >>> outputs = model(**inputs, past_key_values=past_key_values, use_cache=True)
+#         >>> outputs.past_key_values
+#         MambaCache()
+#         ```
+#     """
+
+#     # TODO (joao): remove `=None` in non-optional arguments in v4.46. Remove from `OBJECTS_TO_IGNORE` as well.
+#     def __init__(
+#         self,
+#         config: PretrainedConfig,
+#         batch_size: int = None,
+#         dtype: torch.dtype = torch.float16,
+#         device: Optional[Union[torch.device, str]] = None,
+#         max_batch_size: Optional[int] = None,
+#     ):
+#         if batch_size is not None:
+#             logger.warning_once(
+#                 f"The 'batch_size' argument of {self.__class__.__name__} is deprecated and will be removed in "
+#                 "v4.49. Use the more precisely named 'max_batch_size' argument instead."
+#             )
+#         self.dtype = dtype
+#         self.max_batch_size = batch_size or max_batch_size
+#         self.hidden_size = config.hidden_size
+#         self.intermediate_size = config.intermediate_size
+#         self.ssm_state_size = config.state_size
+#         self.conv_kernel_size = config.conv_kernel
+
+#         self.conv_states: torch.Tensor = torch.zeros(
+#             config.num_hidden_layers + config.lace_num_layers,
+#             self.max_batch_size,
+#             self.intermediate_size,
+#             self.conv_kernel_size,
+#             device=device,
+#             dtype=dtype,
+#         )
+#         self.ssm_states: torch.Tensor = torch.zeros(
+#             config.num_hidden_layers + config.lace_num_layers,
+#             self.max_batch_size,
+#             self.intermediate_size,
+#             self.ssm_state_size,
+#             device=device,
+#             dtype=dtype,
+#         )
+#         self.lace_last_inp_state: torch.Tensor = torch.zeros(
+#             config.lace_num_layers,
+#             self.max_batch_size,
+#             self.intermediate_size,
+#             device=device,
+#             dtype=dtype,
+#         )
+#         self.lace_w_sq_sum: torch.Tensor = torch.zeros(
+#             config.lace_num_layers,
+#             self.max_batch_size,
+#             self.intermediate_size,
+#             device=device,
+#             dtype=dtype,
+#         )
+#         self.lace_w_norm_count: int = 0
+
+#         torch._dynamo.mark_static_address(self.conv_states)
+#         torch._dynamo.mark_static_address(self.ssm_states)
+
+#     def update_conv_state(
+#         self, layer_idx: int, new_conv_state: torch.Tensor, cache_position: torch.LongTensor
+#     ) -> torch.Tensor:
+#         conv_state = self.conv_states[layer_idx]
+#         cache_position = cache_position.clamp(0, self.conv_kernel_size - 1)
+
+#         conv_state = conv_state.roll(shifts=-1, dims=-1)
+#         conv_state[:, :, cache_position] = new_conv_state.to(device=conv_state.device, dtype=conv_state.dtype)
+#         self.conv_states[layer_idx].zero_()
+#         self.conv_states[layer_idx] += conv_state
+#         return self.conv_states[layer_idx]
+    
+#     def update_ssm_state(self, layer_idx: int, new_ssm_state: torch.Tensor):
+#         self.ssm_states[layer_idx] = new_ssm_state.to(self.ssm_states.device)
+#         return self.ssm_states[layer_idx]
+    
+#     def update_lace_last_inp(self, layer_idx: int, last_inp: torch.Tensor):
+#         self.lace_last_inp_state[layer_idx] = last_inp.to(self.lace_last_inp_state.device)
+#         return self.lace_last_inp_state[layer_idx]
+
+#     def reset(self):
+#         self.conv_states.zero_()
+#         self.ssm_states.zero_()
+
+#     @property
+#     def batch_size(self):
+#         logger.warning_once(
+#             f"The 'batch_size' attribute of {self.__class__.__name__} is deprecated and will be removed in "
+#             "v4.49. Use the more precisely named 'self.max_batch_size' attribute instead."
+#         )
+#         return self.max_batch_size
 
 
 class OffloadedStaticCache(StaticCache):
